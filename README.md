@@ -83,7 +83,7 @@ The plugin includes a two-layer background maintenance system that keeps the vau
 
 ### Two-layer model
 
-**Layer 1 — deterministic substrate tick** (`scripts/vaultkeeper-tick.sh`): a pure-bash script that runs on cron (Linux) or launchd (macOS), namespaced `com.nhangen.obsidian-vaultkeeper`. It validates frontmatter against the required keys, scans for unfiled notes, open `[ask]` markers, and promotable clusters, then surfaces candidates into `Librarian.md` and appends only genuinely-new items to `Pending.md`. No LLM involved; no writes to the CEO vault.
+**Layer 1 — deterministic substrate tick** (`scripts/vaultkeeper-tick.sh`): a pure-bash script that runs on cron (Linux) or launchd (macOS), namespaced `com.nhangen.obsidian-vaultkeeper`. It validates frontmatter against the required keys, scans for unfiled notes, open `[ask]` markers, and promotable clusters, then surfaces candidates into `Librarian.md` and appends only genuinely-new items to `Pending.md`. No LLM involved. It touches the CEO vault only through the transition monitor described under Transition monitoring below.
 
 **Layer 2 — on-demand agent** (`/obsidian:ask`): the `vault-librarian` subagent answers queries and acts on the pre-computed candidate lists from Layer 1, only spinning up an LLM when a human query needs it.
 
@@ -105,9 +105,21 @@ bash scripts/install-watcher.sh install "$(pwd)/scripts/vaultkeeper-tick.sh"
 
 Either way the keeper registers under the `com.nhangen.obsidian-vaultkeeper` namespace — visible in `crontab -l` (Linux) or `launchctl list | grep obsidian-vaultkeeper` (macOS) for audits.
 
-### No CEO writes
+### Quarantine resolution and frontmatter backfill
 
-The keeper writes only to the Obsidian vault (`vault_path` from `obsidian.local.md`). It never writes to the CEO vault or any other synced store.
+- **Quarantine resolution** (`scripts/vaultkeeper-resolve-quarantine.sh`): inspect, diff, merge, or discard sync conflict copies isolated in `.vaultkeeper-quarantine/`:
+  - `scripts/vaultkeeper-resolve-quarantine.sh list`
+  - `scripts/vaultkeeper-resolve-quarantine.sh diff <conflict-file>`
+  - `scripts/vaultkeeper-resolve-quarantine.sh merge <conflict-file>` (reconciles checkboxes into `Pending.md`)
+  - `scripts/vaultkeeper-resolve-quarantine.sh discard <conflict-file>`
+- **Frontmatter backfill** (`scripts/vaultkeeper-backfill-frontmatter.sh`): safely backfills missing `tags` in bounded batches (default 50) without touching note bodies or modification timestamps:
+  - `scripts/vaultkeeper-backfill-frontmatter.sh --dry-run` (default preview)
+  - `scripts/vaultkeeper-backfill-frontmatter.sh --apply --limit 50`
+- **Transition monitoring**: the keeper tracks metric transitions across ticks. If `$VAULT/CEO/alerts/` exists, it updates `CEO/alerts/vaultkeeper-quarantine.md` and `CEO/alerts/vaultkeeper-gaps.md`, escalating new actionable transitions to `CEO/inbox.md`. Ticks with no changes post nothing.
+
+### Scoped writes
+
+The keeper writes only within the configured Obsidian vault (`vault_path` from `obsidian.local.md`). It never touches external paths or unsanctioned stores.
 
 ## Hooks
 
