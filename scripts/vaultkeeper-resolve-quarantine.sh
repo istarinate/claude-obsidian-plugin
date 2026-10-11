@@ -41,9 +41,24 @@ _resolve_target_live() {
     _vaultkeeper.base.sync-conflict-*|_vaultkeeper.sync-conflict-*.base) printf '%s/_vaultkeeper.base\n' "$vault" ;;
     *.sync-conflict-*.md)
       local stem="${clean%%.sync-conflict-*}"
-      local found
-      found="$(find "$vault" -type f -name "${stem}.md" ! -path '*/.vaultkeeper-quarantine/*' 2>/dev/null | head -1)"
-      [ -n "$found" ] && printf '%s\n' "$found" || printf '%s/%s.md\n' "$vault" "$stem"
+      # Quarantine flattens the conflict's folder away, so the stem is all there is to
+      # go on. Prefer the vault-root copy, and say so whenever more than one note
+      # shares the stem, since the pick may be the wrong one (#190).
+      local found count pick
+      found="$(find "$vault" -type f -name "${stem}.md" ! -path '*/.vaultkeeper-quarantine/*' 2>/dev/null | LC_ALL=C sort || true)"
+      count="$(printf '%s' "$found" | grep -c . || true)"
+      if [ -f "$vault/${stem}.md" ]; then
+        pick="$vault/${stem}.md"
+      elif [ -n "$found" ]; then
+        pick="$(printf '%s\n' "$found" | head -1)"
+      else
+        pick="$vault/${stem}.md"
+      fi
+      if [ "$count" -gt 1 ]; then
+        printf 'warning: %s notes named %s.md; diffing against %s\n' "$count" "$stem" "$pick" >&2
+        printf '%s\n' "$found" >&2
+      fi
+      printf '%s\n' "$pick"
       ;;
     *)
       printf '%s/%s\n' "$vault" "$clean"
@@ -137,9 +152,7 @@ _merge_pending_locked() {
     rm -f "$tmp"
     return 0
   fi
-  if [ -f "$pending" ]; then
-    chmod "$(stat -c %a "$pending" 2>/dev/null || stat -f %Lp "$pending")" "$tmp" || { rm -f "$tmp"; return 1; }
-  fi
+  keeper_preserve_mode "$tmp" "$pending" || { rm -f "$tmp"; return 1; }
   keeper_swap_or_clean "$tmp" "$pending"
 }
 

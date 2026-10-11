@@ -102,4 +102,56 @@ MODE="$(stat -c %a "$V/Pending.md" 2>/dev/null || stat -f %Lp "$V/Pending.md")"
 ERR="$("$SCRIPT" list --vault 2>&1)" && fail "--vault with no value should exit non-zero"
 grep -qF -- "--vault requires a value" <<<"$ERR" || fail "missing-value message not shown; got: $ERR"
 
+# 12. diff: an unreadable folder elsewhere in the vault does not hide the nested live note
+rm -f "$V/Live.md"
+mkdir -p "$V/Notes" "$V/Locked"
+echo "# Nested live" > "$V/Notes/Nested.md"
+QF="1700000005-Nested.sync-conflict-20261010-060606-MBP.md"
+echo "# Nested conflict" > "$Q/$QF"
+chmod 000 "$V/Locked"
+DIFF_OUT="$("$SCRIPT" diff "$QF" --vault "$V" 2>/dev/null)" || true
+chmod 755 "$V/Locked"
+grep -q -- "^--- live: .*/Notes/Nested.md$" <<<"$DIFF_OUT" || fail "unreadable folder hid the nested live note; got: $DIFF_OUT"
+rm -f "$Q/$QF"
+
+# 13. diff: a vault-root note wins a stem collision, and the collision is reported
+echo "# Root dup" > "$V/Dup.md"
+mkdir -p "$V/A"; echo "# A dup" > "$V/A/Dup.md"
+QF="1700000006-Dup.sync-conflict-20261010-070707-MBP.md"
+echo "# Dup conflict" > "$Q/$QF"
+DIFF_ERR="$TMP/dup.err"
+DIFF_OUT="$("$SCRIPT" diff "$QF" --vault "$V" 2>"$DIFF_ERR")"
+grep -q -- "^--- live: .*/vault/Dup.md$" <<<"$DIFF_OUT" || fail "root note should win the stem collision; got: $DIFF_OUT"
+grep -qF -- "2 notes named Dup.md" "$DIFF_ERR" || fail "root-wins collision not warned; got: $(cat "$DIFF_ERR")"
+
+# 14. diff: with no root note, the nested pick is deterministic and warned
+rm -f "$V/Dup.md"
+mkdir -p "$V/Z"; echo "# Z dup" > "$V/Z/Dup.md"
+DIFF_OUT="$("$SCRIPT" diff "$QF" --vault "$V" 2>"$DIFF_ERR")"
+grep -q -- "^--- live: .*/vault/A/Dup.md$" <<<"$DIFF_OUT" || fail "nested pick should be the sorted first match; got: $DIFF_OUT"
+grep -qF -- "2 notes named Dup.md" "$DIFF_ERR" || fail "nested collision not warned; got: $(cat "$DIFF_ERR")"
+rm -f "$Q/$QF"
+
+# 15. merge: when Pending.md's mode cannot be read, the merge stops and keeps the copy
+REAL_STAT="$(command -v stat)"
+mkdir -p "$TMP/stub"
+cat > "$TMP/stub/stat" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *%a*|*%Lp*) exit 1 ;;
+  *) exec "$REAL_STAT" "\$@" ;;
+esac
+STUB
+chmod +x "$TMP/stub/stat"
+printf -- '- [ ] a\n' > "$V/Pending.md"; chmod 644 "$V/Pending.md"
+QF="1700000007-Pending.sync-conflict-20261010-080808-MBP.md"
+printf -- '- [ ] mode probe\n' > "$Q/$QF"
+if ERR="$(PATH="$TMP/stub:$PATH" "$SCRIPT" merge "$QF" --vault "$V" 2>&1 >/dev/null)"; then
+  fail "merge should fail when Pending.md's mode cannot be read"
+fi
+[ -f "$Q/$QF" ] || fail "quarantine copy deleted although the merge was not applied"
+grep -qF -- "mode probe" "$V/Pending.md" && fail "Pending.md swapped without its mode"
+grep -qF -- "could not read mode" <<<"$ERR" || fail "mode failure not reported; got: $ERR"
+rm -f "$Q/$QF"
+
 echo "PASS: vaultkeeper-resolve-quarantine"

@@ -253,3 +253,18 @@ keeper_swap_or_clean() {
   printf 'keeper: could not replace %s; the staged temp file was discarded\n' "$target" >&2
   return 1
 }
+
+# chmod the replacement to the live file's mode before the swap. mktemp always
+# stages 0600, so swapping it over a 0644 user note silently tightens the permission
+# the vault already carried — and Syncthing replicates that mode to every host (#190).
+# It is the one step keeper_swap_or_clean cannot repair: after the mv the original
+# mode is gone. Call it just before the swap.
+keeper_preserve_mode() {
+  local tmp="$1" target="$2" mode
+  [ -f "$target" ] || return 0
+  mode="$(stat -c %a "$target" 2>/dev/null || stat -f %Lp "$target" 2>/dev/null)" || {
+    printf 'keeper: could not read mode of %s\n' "$target" >&2
+    return 1
+  }
+  chmod "$mode" "$tmp"
+}

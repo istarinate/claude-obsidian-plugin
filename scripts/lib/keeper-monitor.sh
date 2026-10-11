@@ -6,6 +6,31 @@
 #
 # Bash 3.2 and zsh clean. Requires note-hash.sh and keeper-state.sh.
 
+# Two ticks can both see the line missing and both append it, so the check is
+# repeated under the keeper lock (#190). Returns 2 when the append itself fails, which
+# keeper_with_lock passes through; its own 1 means the lock was never taken.
+_km_inbox_escalate_locked() {
+  local inbox="$1" pattern="$2" item="$3"
+  grep -qE "$pattern" "$inbox" 2>/dev/null && return 0
+  printf '\n%s\n' "$item" >> "$inbox" || return 2
+}
+
+# Without the lock the task is still appended: a duplicate line beats a dropped one.
+_km_inbox_escalate() {
+  local vault="$1" pattern="$2" item="$3" inbox="$1/CEO/inbox.md" canonical rc=1
+  grep -qE "$pattern" "$inbox" 2>/dev/null && return 0
+  if canonical="$(cd "$vault" 2>/dev/null && pwd -P)"; then
+    if keeper_with_lock "$canonical" _km_inbox_escalate_locked "$inbox" "$pattern" "$item"; then
+      return 0
+    else
+      rc=$?
+    fi
+    [ "$rc" -eq 2 ] && return 1
+  fi
+  printf 'vaultkeeper: inbox lock unavailable; appending to %s without it\n' "$inbox" >&2
+  printf '\n%s\n' "$item" >> "$inbox"
+}
+
 _km_read_state_val() {
   local f="$1" k="$2"
   [ -f "$f" ] || return 1
@@ -131,15 +156,18 @@ EOF
             printf 'Quarantine is clear (no conflicting note copies).\n'
           fi
         } > "$q_tmp"
-        keeper_swap_or_clean "$q_tmp" "$q_alert_file" || rc=1
+        if keeper_preserve_mode "$q_tmp" "$q_alert_file"; then
+          keeper_swap_or_clean "$q_tmp" "$q_alert_file" || rc=1
+        else
+          rm -f "$q_tmp"; rc=1
+        fi
       fi
 
       # Escalate to inbox.md strictly on clear -> firing transition
       if [ "$q_transition" -eq 1 ] && [ "$new_q_status" = "firing" ] && [ -f "$vault/CEO/inbox.md" ]; then
-        local inbox_item="- [ ] Resolve ${cur_q_count} quarantined sync conflict(s) in .vaultkeeper-quarantine/ (run scripts/vaultkeeper-resolve-quarantine.sh)"
-        if ! grep -qE '^- \[ \] Resolve [0-9]+ quarantined sync conflict' "$vault/CEO/inbox.md" 2>/dev/null; then
-          printf '\n%s\n' "$inbox_item" >> "$vault/CEO/inbox.md"
-        fi
+        _km_inbox_escalate "$vault" '^- \[ \] Resolve [0-9]+ quarantined sync conflict' \
+          "- [ ] Resolve ${cur_q_count} quarantined sync conflict(s) in .vaultkeeper-quarantine/ (run scripts/vaultkeeper-resolve-quarantine.sh)" \
+          || rc=1
       fi
     fi
 
@@ -172,15 +200,18 @@ EOF
             printf 'Frontmatter gaps are stable or trending down.\n'
           fi
         } > "$g_tmp"
-        keeper_swap_or_clean "$g_tmp" "$gap_alert_file" || rc=1
+        if keeper_preserve_mode "$g_tmp" "$gap_alert_file"; then
+          keeper_swap_or_clean "$g_tmp" "$gap_alert_file" || rc=1
+        else
+          rm -f "$g_tmp"; rc=1
+        fi
       fi
 
       # Escalate to inbox.md strictly on clear -> firing transition
       if [ "$gap_transition" -eq 1 ] && [ "$new_gap_status" = "firing" ] && [ -f "$vault/CEO/inbox.md" ]; then
-        local gap_inbox_item="- [ ] Frontmatter gaps grew (+${gap_delta}, total ${cur_gap_count}) (run scripts/vaultkeeper-backfill-frontmatter.sh)"
-        if ! grep -qE '^- \[ \] Frontmatter gaps grew' "$vault/CEO/inbox.md" 2>/dev/null; then
-          printf '\n%s\n' "$gap_inbox_item" >> "$vault/CEO/inbox.md"
-        fi
+        _km_inbox_escalate "$vault" '^- \[ \] Frontmatter gaps grew' \
+          "- [ ] Frontmatter gaps grew (+${gap_delta}, total ${cur_gap_count}) (run scripts/vaultkeeper-backfill-frontmatter.sh)" \
+          || rc=1
       fi
     fi
   fi

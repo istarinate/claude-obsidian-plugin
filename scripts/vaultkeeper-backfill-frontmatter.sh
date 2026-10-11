@@ -63,10 +63,6 @@ _infer_tags() {
   printf '%s\n' "$tags"
 }
 
-_file_mode() {
-  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
-}
-
 _patch_frontmatter() {
   local file="$1" tags="$2" tmp="$3"
   local has_fm=0
@@ -79,6 +75,17 @@ _patch_frontmatter() {
   fi
 
   if [ "$has_fm" = "1" ]; then
+    # An unclosed frontmatter block is a malformed note, not a tags gap. Both awk
+    # rewrites below assume a closing --- exists; run against an unclosed file one of
+    # them re-emits the whole body as frontmatter, and the other silently drops the
+    # block. The patched-file verification catches the first case, but --dry-run
+    # never patches, so it printed [dry-run] for a note --apply would report [failed]
+    # (#190): dry-run and apply must agree on which notes are patchable.
+    local closing
+    closing="$(awk 'NR>1 && $0=="---" { print NR; exit }' "$file")"
+    if [ -z "$closing" ]; then
+      return 3
+    fi
     # Has frontmatter: check if tags: already present
     local has_tags=0
     if frontmatter_keys "$file" | grep -qxF "tags"; then
@@ -141,7 +148,10 @@ main() {
   printf 'vaultkeeper-backfill: scanning for notes missing tags (mode=%s, limit=%s)\n' "$mode" "$limit"
 
   local gaps_found=0 updated=0 failed=0
-  local f rel missing tags tmp
+  local f rel missing tags reason prc tmp="" stage_dir="$vault"
+  [ "$mode" = "dry-run" ] && stage_dir="${TMPDIR:-/tmp}"
+  trap 'rm -f "${tmp:-}"; exit 130' INT
+  trap 'rm -f "${tmp:-}"; exit 143' TERM
 
   while IFS= read -r f; do
     missing="$(frontmatter_missing "$f" "tags")"
@@ -151,28 +161,35 @@ main() {
         rel="${f#"$vault"/}"
         tags="$(_infer_tags "$vault" "$f")"
 
-        if [ "$mode" = "dry-run" ]; then
-          printf '  [dry-run] %s -> tags: [%s]\n' "$rel" "$tags"
-          updated=$(( updated + 1 ))
-        else
-          tmp="$(mktemp "$vault/.backfill-XXXXXX")" || {
-            printf 'error: cannot create temp file\n' >&2
-            failed=$(( failed + 1 ))
-            continue
-          }
-          if ! _patch_frontmatter "$f" "$tags" "$tmp" \
-            || [ -n "$(frontmatter_missing "$tmp" "tags")" ] \
-            || ! chmod "$(_file_mode "$f")" "$tmp" \
-            || ! touch -r "$f" "$tmp" \
-            || ! keeper_swap_or_clean "$tmp" "$f"; then
-            rm -f "$tmp"
-            printf '  [failed] %s (frontmatter could not be patched; note left unchanged)\n' "$rel" >&2
-            failed=$(( failed + 1 ))
-            continue
-          fi
-          printf '  [applied] %s -> tags: [%s] (mtime preserved)\n' "$rel" "$tags"
-          updated=$(( updated + 1 ))
+        # Both modes stage and verify the same patch, so dry-run reports [failed] for
+        # exactly the notes --apply would refuse (#190). Only --apply swaps, and only
+        # the swap needs the temp on the vault's filesystem.
+        tmp="$(mktemp "$stage_dir/.backfill-XXXXXX")" || {
+          printf 'error: cannot create temp file for %s\n' "$rel" >&2
+          failed=$(( failed + 1 ))
+          continue
+        }
+        reason="frontmatter could not be patched"
+        if _patch_frontmatter "$f" "$tags" "$tmp"; then prc=0; else prc=$?; fi
+        [ "$prc" -eq 3 ] && reason="unclosed frontmatter"
+        if [ "$prc" -ne 0 ] \
+          || [ -n "$(frontmatter_missing "$tmp" "tags")" ] \
+          || { [ "$mode" = "apply" ] && {
+                 ! keeper_preserve_mode "$tmp" "$f" \
+                 || ! touch -r "$f" "$tmp" \
+                 || ! keeper_swap_or_clean "$tmp" "$f"; }; }; then
+          rm -f "$tmp"
+          printf '  [failed] %s (%s; note left unchanged)\n' "$rel" "$reason" >&2
+          failed=$(( failed + 1 ))
+          continue
         fi
+        if [ "$mode" = "dry-run" ]; then
+          rm -f "$tmp"
+          printf '  [dry-run] %s -> tags: [%s]\n' "$rel" "$tags"
+        else
+          printf '  [applied] %s -> tags: [%s] (mtime preserved)\n' "$rel" "$tags"
+        fi
+        updated=$(( updated + 1 ))
       fi
     fi
   done < <(_scan_find_md "$vault")

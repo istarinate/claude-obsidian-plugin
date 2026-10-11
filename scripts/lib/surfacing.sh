@@ -36,6 +36,7 @@ _surfacing_digest_locked() {
       [ -n "$sel" ] && printf '%s\n' "$sel" | cut -f2- | sed 's/^/- /'
     done
   } > "$tmp"
+  keeper_preserve_mode "$tmp" "$target" || { rm -f "$tmp"; return 1; }
   keeper_swap_or_clean "$tmp" "$target"
 }
 
@@ -89,6 +90,7 @@ _surfacing_pending_append_locked() {
     rm -f "$tmp"
     return 0
   fi
+  keeper_preserve_mode "$tmp" "$pending" || { rm -f "$tmp"; return 1; }
   keeper_swap_or_clean "$tmp" "$pending"
 }
 
