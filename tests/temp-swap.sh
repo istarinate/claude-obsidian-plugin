@@ -3,11 +3,10 @@
 # is discarded and the caller hears about it. One of these sites stages into the vault
 # root, so a leak is visible in Obsidian and Syncthing replicates it to every host.
 #
-# Each arm makes the *swap* fail while mktemp still succeeds — the target is a
-# directory the process cannot write into, so `mv file dir/file` is refused — because a
-# failed mktemp returns before there is anything to leak, which is a different (already
-# handled) path. Note a *writable* directory is no good: `mv f d` succeeds by moving f
-# into d.
+# Arms 1–3 make the *swap* fail while mktemp still succeeds, because a failed mktemp
+# returns before there is anything to leak, which is a different (already handled) path.
+# Arms 1–2 aim at a directory target, which keeper_swap_or_clean rejects before any mv;
+# arm 3 is the one that reaches a refused mv.
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "${ROOT_DIR}/scripts/lib/note-hash.sh"
@@ -78,19 +77,65 @@ DUPS="$(grep '^- \[ \]' "$V/Pending.md" | sort | uniq -d | wc -l | tr -d ' ')"
 [ "$DUPS" = "0" ] \
   || fail "a stuck snapshot duplicated $DUPS Pending.md line(s) over four ticks:"$'\n'"$(cat "$V/Pending.md")"
 
-# keeper_preserve_mode: the staged temp takes the live file's mode, and a missing target leaves it alone
+# 5. keeper_swap_or_clean mode enforcement: existing target preserves mode, absent target
+#    applies 0666 & ~umask (not mktemp's 0600), and stat/chmod failures discard temp.
 PM="$TMP/pm"; mkdir -p "$PM"
-printf 'live\n' > "$PM/live.md"; chmod 644 "$PM/live.md"
-PT="$(mktemp "$PM/.t-XXXXXX")"
-keeper_preserve_mode "$PT" "$PM/live.md" || fail "keeper_preserve_mode failed on a readable target"
-[ "$(stat -c %a "$PT" 2>/dev/null || stat -f %Lp "$PT")" = "644" ] || fail "temp did not take the target's 644 mode"
-PT2="$(mktemp "$PM/.t-XXXXXX")"
-keeper_preserve_mode "$PT2" "$PM/absent.md" || fail "a missing target should be a no-op, not a failure"
-[ "$(stat -c %a "$PT2" 2>/dev/null || stat -f %Lp "$PT2")" = "600" ] || fail "a missing target changed the temp's mode"
+# 640 under umask 022: the new-file default would be 644, so only preservation yields 640.
+(
+  umask 022
+  printf 'live\n' > "$PM/live.md"; chmod 640 "$PM/live.md"
+  PT="$(mktemp "$PM/.t-XXXXXX")"
+  keeper_swap_or_clean "$PT" "$PM/live.md" || fail "keeper_swap_or_clean failed on a readable target"
+  [ "$(stat -c %a "$PM/live.md" 2>/dev/null || stat -L -f %Lp "$PM/live.md")" = "640" ] || fail "target did not preserve 640 mode"
+)
+
+# A symlinked target takes its referent's mode, not the link's own (0777 under GNU stat
+# on Linux, 0755 under BSD stat), which would leave the note world-writable.
+printf 'real\n' > "$PM/real.md"; chmod 640 "$PM/real.md"; ln -s real.md "$PM/link.md"
+PT6="$(mktemp "$PM/.t-XXXXXX")"
+keeper_swap_or_clean "$PT6" "$PM/link.md" || fail "keeper_swap_or_clean failed on a symlinked target"
+[ "$(stat -L -c %a "$PM/link.md" 2>/dev/null || stat -L -f %Lp "$PM/link.md")" = "640" ] || fail "symlinked target took the link's mode, not its referent's 640"
+
+# Absent target takes 0666 & ~umask, not mktemp's 0600. Pinned so a host umask of 077,
+# where the default equals 0600, cannot make this pass with the fix reverted.
+(
+  umask 027
+  PT2="$(mktemp "$PM/.t-XXXXXX")"
+  keeper_swap_or_clean "$PT2" "$PM/absent.md" || fail "keeper_swap_or_clean failed for new target"
+  [ "$(stat -c %a "$PM/absent.md" 2>/dev/null || stat -L -f %Lp "$PM/absent.md")" = "640" ] || fail "new target did not get umask default 640"
+)
+
+# Target stat failure aborts swap, removes temp, and logs error
 PT3="$(mktemp "$PM/.t-XXXXXX")"
 stat() { return 1; }
-if PM_ERR="$(keeper_preserve_mode "$PT3" "$PM/live.md" 2>&1)"; then unset -f stat; fail "keeper_preserve_mode should fail when stat cannot read the mode"; fi
+if PM_ERR="$(keeper_swap_or_clean "$PT3" "$PM/live.md" 2>&1)"; then unset -f stat; fail "swap should fail when stat cannot read mode"; fi
 unset -f stat
 grep -qF "could not read mode" <<<"$PM_ERR" || fail "stat failure was silent; got: $PM_ERR"
+[ ! -e "$PT3" ] || fail "staged temp was not discarded on stat failure"
+
+# Chmod failure aborts swap, removes temp, and logs error
+PT4="$(mktemp "$PM/.t-XXXXXX")"
+chmod() { return 1; }
+if CHMOD_ERR="$(keeper_swap_or_clean "$PT4" "$PM/live.md" 2>&1)"; then unset -f chmod; fail "swap should fail when chmod fails"; fi
+unset -f chmod
+grep -qF "could not apply mode 640 for $PM/live.md" <<<"$CHMOD_ERR" || fail "chmod failure was silent; got: $CHMOD_ERR"
+[ ! -e "$PT4" ] || fail "staged temp was not discarded on chmod failure"
+
+# Unreadable umask aborts a new-target swap, removes temp, and logs error
+PT7="$(mktemp "$PM/.t-XXXXXX")"
+umask() { echo bad; }
+if UMASK_ERR="$(keeper_swap_or_clean "$PT7" "$PM/absent2.md" 2>&1)"; then unset -f umask; fail "swap should fail when umask cannot be read"; fi
+unset -f umask
+grep -qF "could not read umask" <<<"$UMASK_ERR" || fail "umask failure was silent; got: $UMASK_ERR"
+[ ! -e "$PT7" ] || fail "staged temp was not discarded on umask failure"
+[ ! -e "$PM/absent2.md" ] || fail "target was created despite the umask failure"
+
+# Directory target aborts swap, removes temp, and does not move temp into directory
+mkdir -p "$PM/dir_target"
+PT5="$(mktemp "$PM/.t-XXXXXX")"
+if DIR_ERR="$(keeper_swap_or_clean "$PT5" "$PM/dir_target" 2>&1)"; then fail "swap should fail when target is directory"; fi
+grep -qF "target is a directory" <<<"$DIR_ERR" || fail "directory error not reported; got: $DIR_ERR"
+[ ! -e "$PT5" ] || fail "staged temp was not discarded on directory target"
+[ ! -e "$PM/dir_target/$(basename "$PT5")" ] || fail "temp leaked into directory target"
 
 echo "PASS: temp-swap"
