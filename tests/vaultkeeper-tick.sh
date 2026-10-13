@@ -227,23 +227,78 @@ _fdclusters="$(grep -c '^- ' "$FDV/Librarian.md" || true)"
 [ "$_fdclusters" -ge 240 ] \
   || fail "the digest lists only $_fdclusters rows under ulimit -n 64; the candidate set was truncated"
 
-# 2. Pre-#49 scanner, same limit: the tick must NOT record the scan as complete.
+# 2. Pre-#49 scanner, same limit. The historical fd leak is reproducible
+# with macOS's Bash 3.2, but not with the Bash 5.2 shipped on Ubuntu 24.04:
+# modern Bash closes those process-substitution descriptors. Run the historical
+# implementation everywhere, then validate the observed platform-specific result
+# rather than claiming Linux reproduced a bug its Bash no longer has.
 FDLIB="$TMP/fdticklib"; mkdir -p "$FDLIB"; cp "${ROOT_DIR}"/scripts/lib/*.sh "$FDLIB/"
+OLD_SCAN="$TMP/pre-49-scan-clusters.sh"
 git -C "$ROOT_DIR" show f670411^:scripts/lib/vault-scan.sh \
-  | sed -n '/^scan_clusters/,/^}/p' >> "$FDLIB/vault-scan.sh" \
+  | sed -n '/^scan_clusters() {/,/^}/p' > "$OLD_SCAN" \
   || fail "could not recover the pre-#49 scan_clusters from git history"
+[ -s "$OLD_SCAN" ] || fail "the historical scan_clusters extraction was empty"
+grep -q '^scan_clusters() {' "$OLD_SCAN" || fail "the historical scan_clusters definition was not recovered"
+[ "$(tail -n 1 "$OLD_SCAN")" = "}" ] || fail "the historical scan_clusters function was incomplete"
+"$_FDBASH" -n "$OLD_SCAN" || fail "the historical scan_clusters function is not valid Bash"
+cat "$OLD_SCAN" >> "$FDLIB/vault-scan.sh"
 FDS="$TMP/fdtickscripts"; mkdir -p "$FDS"; cp "${ROOT_DIR}"/scripts/*.sh "$FDS/" 2>/dev/null || true
 cp -R "$FDLIB" "$FDS/lib"
+# Verify the augmented library's final scan_clusters is exactly the recovered
+# historical definition, so a failed append cannot silently test current code.
+"$_FDBASH" -c 'set -e; . "$1"; declare -f scan_clusters' _ "$OLD_SCAN" > "$TMP/expected-old-scan.sh" \
+  || fail "could not load the historical scan_clusters definition"
+"$_FDBASH" -c 'set -e; . "$1"; declare -f scan_clusters' _ "$FDLIB/vault-scan.sh" > "$TMP/loaded-old-scan.sh" \
+  || fail "could not load the augmented vault-scan library"
+cmp -s "$TMP/expected-old-scan.sh" "$TMP/loaded-old-scan.sh" \
+  || fail "the historical scan_clusters definition was not the one loaded"
 FDV2="$TMP/fdtickvault2"; cp -R "$FDV" "$FDV2"; rm -f "$FDV2/Librarian.md" "$FDV2/Pending.md"
 FDCFG2="$TMP/fdtick2.local.md"; sed "s|^vault_path: .*|vault_path: $FDV2|" "$CFG" > "$FDCFG2"
+[ ! -f "$(keeper_last_scan_file "$FDV2")" ] || fail "the historical scan fixture already has last_scan"
+[ ! -f "$(keeper_last_attempt_file "$FDV2")" ] || fail "the historical scan fixture already has last_attempt"
+keeper_has_snapshot "$FDV2" && fail "the historical scan fixture already has a snapshot"
 FD2="$TMP/fdtick-old.out"
 ( ulimit -n 64; OBSIDIAN_LOCAL_MD="$FDCFG2" VAULTKEEPER_HOST="ml-1" \
     "$_FDBASH" "$FDS/vaultkeeper-tick.sh" >"$FD2" 2>&1 ) \
-  || fail "the reverted-scanner tick aborted rather than reporting; got: $(cat "$FD2")"
-grep -q 'scan INCOMPLETE' "$FD2" \
-  || fail "the pre-#49 scanner exhausted fds and the tick still called the scan complete — the gate does not see it: $(cat "$FD2")"
-[ -f "$(keeper_last_scan_file "$FDV2")" ] \
-  && fail "the reverted-scanner tick recorded last_scan on a truncated scan"
+  || fail "the historical-scanner tick aborted rather than reporting; got: $(cat "$FD2")"
+_FDBASH_VERSION="$("$_FDBASH" -c 'printf "%s" "$BASH_VERSION"')"
+if grep -q '^vaultkeeper: scan INCOMPLETE ' "$FD2"; then
+  grep -qi 'too many open files' "$FD2" \
+    || fail "the historical scanner was incomplete for a reason other than fd exhaustion: $(cat "$FD2")"
+  grep -q '^vaultkeeper: scan complete ' "$FD2" \
+    && fail "the historical scan reported both complete and incomplete: $(cat "$FD2")"
+  grep -q '^scan_status: INCOMPLETE$' "$FDV2/Librarian.md" \
+    || fail "the fd-faulted digest did not declare scan_status: INCOMPLETE"
+  [ ! -f "$(keeper_last_scan_file "$FDV2")" ] \
+    || fail "the faulted historical scan recorded last_scan"
+  keeper_has_snapshot "$FDV2" && fail "the faulted historical scan wrote a truncated snapshot"
+  printf 'note: Bash %s reproduced the pre-#49 fd exhaustion; the tick marked the scan incomplete\n' "$_FDBASH_VERSION" >&2
+else
+  grep -q '^vaultkeeper: scan complete ' "$FD2" \
+    || fail "the historical scan produced neither a complete nor an incomplete result: $(cat "$FD2")"
+  grep -q '^vaultkeeper: scan INCOMPLETE ' "$FD2" \
+    && fail "the historical scan reported both complete and incomplete: $(cat "$FD2")"
+  grep -qi 'too many open files' "$FD2" \
+    && fail "the historical scan reported fd exhaustion but was marked complete: $(cat "$FD2")"
+  ! grep -q '^scan_status: INCOMPLETE$' "$FDV2/Librarian.md" \
+    || fail "a complete historical scan left an incomplete marker in the digest"
+  [ -f "$(keeper_last_scan_file "$FDV2")" ] \
+    || fail "the complete historical scan did not record last_scan"
+  keeper_has_snapshot "$FDV2" \
+    || fail "the complete historical scan did not write its candidate snapshot"
+  grep -q '^## Promotable clusters (240)$' "$FDV2/Librarian.md" \
+    || fail "the complete historical digest did not report all 240 clusters: $(grep '^## Promotable clusters' "$FDV2/Librarian.md" || true)"
+  EXPECTED_CLUSTERS="$TMP/expected-clusters.tsv"
+  ACTUAL_CLUSTERS="$TMP/actual-clusters.tsv"
+  for _i in $(seq 1 120); do
+    printf 'CLUSTER\tFolder %s\tnote\t3\n' "$_i"
+    printf 'CLUSTER\tFolder %s\ttopic%s\t3\n' "$_i" "$_i"
+  done | LC_ALL=C sort > "$EXPECTED_CLUSTERS"
+  keeper_read_snapshot "$FDV2" | LC_ALL=C sort > "$ACTUAL_CLUSTERS"
+  cmp -s "$EXPECTED_CLUSTERS" "$ACTUAL_CLUSTERS" \
+    || { diff -u "$EXPECTED_CLUSTERS" "$ACTUAL_CLUSTERS" >&2 || true; fail "the complete historical snapshot did not contain exactly the 240 expected clusters"; }
+  printf 'note: Bash %s did not reproduce the pre-#49 fd exhaustion; the historical scan produced all 240 clusters\n' "$_FDBASH_VERSION" >&2
+fi
 
 # --- a failed quarantine move is a fault too (#53) ---------------------------
 # `CONFLICTS="$(keeper_quarantine_conflicts … || true)"` ran above the buffer, so a
