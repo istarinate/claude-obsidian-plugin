@@ -14,24 +14,32 @@ grep -q '<integer>900</integer>' <<<"$PLIST_PADDED" || fail "launchd did not nor
 
 # Interval validation is shared by both renderers and has a distinct status from
 # an ordinary install failure. Preserve the exact submitted value in diagnostics,
-# including an overlong decimal rejected before Bash arithmetic can overflow.
+# including values above launchd's uint32 StartInterval limit.
 INVALID_INTERVAL_STATUS=64
 LONG_INTERVAL=18446744073709551616
-MAX_INTERVAL=999999999999999999
+PADDED_MAX_INTERVAL="$(printf '%015d' 0)900"
+LONG_PADDED_INTERVAL="$(printf '%018d' 0)900"
+MAX_INTERVAL=4294967295
 MAX_PLIST="$(bash "$SH" render-launchd "$TICK" "$MAX_INTERVAL")"
 grep -q "<integer>${MAX_INTERVAL}</integer>" <<<"$MAX_PLIST" \
-  || fail "an 18-digit interval was incorrectly rejected or changed"
+  || fail "the maximum supported interval was incorrectly rejected or changed"
 MAX_CRON_ERR="$(mktemp "${TMPDIR:-/tmp}/iw-max-cron-XXXXXX")"
 if max_cron_out="$(bash "$SH" render-cron "$TICK" "$MAX_INTERVAL" 2>"$MAX_CRON_ERR")"; then
-  fail "cron accepted an unrepresentable 18-digit interval"
+  fail "cron accepted an unrepresentable maximum interval"
 else
-  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "18-digit cron refusal did not return status $INVALID_INTERVAL_STATUS"
+  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "maximum cron refusal did not return status $INVALID_INTERVAL_STATUS"
 fi
-[ -z "$max_cron_out" ] || fail "18-digit cron refusal printed output: $max_cron_out"
+[ -z "$max_cron_out" ] || fail "maximum cron refusal printed output: $max_cron_out"
 grep -Fq "(${MAX_INTERVAL}s)" "$MAX_CRON_ERR" \
-  || fail "18-digit cron diagnostic overflowed or lost its positive value: $(cat "$MAX_CRON_ERR")"
+  || fail "maximum cron diagnostic overflowed or lost its positive value: $(cat "$MAX_CRON_ERR")"
 rm -f "$MAX_CRON_ERR"
-for bad in "" 0 000 abc +900 -900 "$LONG_INTERVAL"; do
+PADDED_PLIST="$(bash "$SH" render-launchd "$TICK" "$PADDED_MAX_INTERVAL")"
+grep -q '<integer>900</integer>' <<<"$PADDED_PLIST" || fail "an 18-digit padded interval was not normalized"
+PADDED_CRON="$(bash "$SH" render-cron "$TICK" "$PADDED_MAX_INTERVAL")"
+grep -q '^\*/15 ' <<<"$PADDED_CRON" || fail "an 18-digit padded interval was not accepted by cron"
+[ "${#PADDED_MAX_INTERVAL}" -eq 18 ] || fail "padded-interval test input is not 18 digits"
+[ "${#LONG_PADDED_INTERVAL}" -gt 18 ] || fail "long padded-interval test input is not over 18 digits"
+for bad in "" 0 000 abc +900 -900 4294967296 9223372036854775860 99999999999999999999 "$LONG_INTERVAL" "$LONG_PADDED_INTERVAL"; do
   for mode in render-launchd render-cron; do
     errfile="$(mktemp "${TMPDIR:-/tmp}/iw-interval-XXXXXX")"
     if out="$(bash "$SH" "$mode" "$TICK" "$bad" 2>"$errfile")"; then
@@ -181,19 +189,34 @@ trap 'rm -rf "$HOMEDIR" "$CRONDIR"' EXIT
 mkdir -p "$HOMEDIR/Library/LaunchAgents" "$HOMEDIR/bin"
 PL="$HOMEDIR/Library/LaunchAgents/com.nhangen.obsidian-vaultkeeper.plist"
 # A launchctl that always succeeds, so the only thing under test is the refusal.
-printf '#!/usr/bin/env bash\nexit 0\n' > "$HOMEDIR/bin/launchctl"
+cat > "$HOMEDIR/bin/launchctl" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$HOMEDIR/launchctl.calls"
+exit 0
+EOF
 printf '#!/usr/bin/env bash\necho Darwin\n' > "$HOMEDIR/bin/uname"
 chmod +x "$HOMEDIR/bin/launchctl" "$HOMEDIR/bin/uname"
 
-# Invalid intervals must be refused before OS dispatch or plist creation. This is
-# the regression for launchd accepting a malformed StartInterval that cron rejected.
-if HOME="$HOMEDIR" PATH="$HOMEDIR/bin:$PATH" bash "$SH" install "$TICK" 000 >"$HOMEDIR/invalid.out" 2>"$HOMEDIR/invalid.err"; then
-  fail "macOS install accepted a zero interval"
-else
-  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "macOS invalid interval did not return status $INVALID_INTERVAL_STATUS"
-fi
-[ ! -e "$PL" ] || fail "macOS install created a plist for an invalid interval"
-grep -Fq "'000'" "$HOMEDIR/invalid.err" || fail "macOS refusal did not retain the original interval"
+# launchd accepts at most UINT32_MAX seconds; this boundary value must install.
+HOME="$HOMEDIR" PATH="$HOMEDIR/bin:$PATH" bash "$SH" install "$TICK" "$MAX_INTERVAL" >/dev/null \
+  || fail "macOS install rejected the maximum supported interval"
+grep -q "<integer>${MAX_INTERVAL}</integer>" "$PL" || fail "macOS install changed the maximum interval"
+[ -s "$HOMEDIR/launchctl.calls" ] || fail "maximum interval install did not reach launchctl"
+
+# Values above UINT32_MAX must be rejected before plist/log creation or launchctl.
+for bad in 4294967296 9223372036854775860 99999999999999999999 "$LONG_PADDED_INTERVAL"; do
+  rm -f "$PL" "$HOMEDIR/launchctl.calls"
+  rm -rf "$HOMEDIR/Library/Logs"
+  if HOME="$HOMEDIR" PATH="$HOMEDIR/bin:$PATH" bash "$SH" install "$TICK" "$bad" >"$HOMEDIR/invalid.out" 2>"$HOMEDIR/invalid.err"; then
+    fail "macOS install accepted interval '$bad' above UINT32_MAX"
+  else
+    [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "macOS refusal for '$bad' did not return status $INVALID_INTERVAL_STATUS"
+  fi
+  [ ! -e "$PL" ] || fail "macOS install created a plist for invalid interval '$bad'"
+  [ ! -d "$HOMEDIR/Library/Logs" ] || fail "macOS install created a log directory for invalid interval '$bad'"
+  [ ! -e "$HOMEDIR/launchctl.calls" ] || fail "macOS install invoked launchctl for invalid interval '$bad'"
+  grep -Fq -- "'$bad'" "$HOMEDIR/invalid.err" || fail "macOS refusal lost original interval '$bad'"
+done
 
 write_delegator_plist() {
   cat > "$PL" <<EOF

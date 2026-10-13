@@ -7,6 +7,8 @@ LABEL="com.nhangen.obsidian-vaultkeeper"
 # Kept distinct from an ordinary install failure so callers can tell a permanent
 # interval/configuration refusal from a transient scheduler problem.
 INVALID_INTERVAL_STATUS=64
+MAX_START_INTERVAL=4294967295
+MAX_INTERVAL_INPUT_DIGITS=18
 
 usage() { echo "usage: install-watcher.sh {label|installed-program|state|render-launchd|render-cron|install} <tick_abs_path> [interval_secs]" >&2; exit 2; }
 
@@ -49,21 +51,25 @@ _own_cron_line() {
   esac
 }
 
-# Validate ASCII decimal input before any scheduler-specific work. Limiting it to 18 digits
-# keeps every accepted value below Bash's signed 64-bit arithmetic limit, including
-# on macOS's system Bash 3.2. Strip zero padding as text first: arithmetic on a
-# leading-zero value can interpret it as octal, while StartInterval must be a
-# positive decimal integer.
+# Validate ASCII decimal input before any scheduler-specific work. launchd stores
+# StartInterval as a uint32, so values above 4294967295 are silently ignored there.
+# Reject raw input longer than 18 ASCII digits before stripping zero padding; then cap
+# the normalized decimal at ten digits before numeric comparison to prevent overflow.
+_refuse_interval() {
+  printf "install-watcher: interval '%s' must be a positive decimal integer of at most %s digits and no greater than %s seconds\n" \
+    "$1" "$MAX_INTERVAL_INPUT_DIGITS" "$MAX_START_INTERVAL" >&2
+}
+
 normalize_interval() {
   local original="$1" normalized
   case "$original" in
     ''|*[!0123456789]*)
-      printf "install-watcher: interval '%s' must be a nonzero decimal integer of at most 18 digits\n" "$original" >&2
+      _refuse_interval "$original"
       return "$INVALID_INTERVAL_STATUS"
       ;;
   esac
-  if [ "${#original}" -gt 18 ]; then
-    printf "install-watcher: interval '%s' must be a nonzero decimal integer of at most 18 digits\n" "$original" >&2
+  if [ "${#original}" -gt "$MAX_INTERVAL_INPUT_DIGITS" ]; then
+    _refuse_interval "$original"
     return "$INVALID_INTERVAL_STATUS"
   fi
   normalized="$original"
@@ -71,7 +77,11 @@ normalize_interval() {
     normalized="${normalized#0}"
   done
   if [ -z "$normalized" ]; then
-    printf "install-watcher: interval '%s' must be greater than zero\n" "$original" >&2
+    _refuse_interval "$original"
+    return "$INVALID_INTERVAL_STATUS"
+  fi
+  if [ "${#normalized}" -gt 10 ] || { [ "${#normalized}" -eq 10 ] && [ "$normalized" -gt "$MAX_START_INTERVAL" ]; }; then
+    _refuse_interval "$original"
     return "$INVALID_INTERVAL_STATUS"
   fi
   printf '%s\n' "$normalized"
