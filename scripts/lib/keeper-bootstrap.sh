@@ -258,14 +258,20 @@ keeper_ensure_active() {
   _kb_cfg_ensure keeper_interval_secs "$interval" "$cfg" \
     || printf 'vaultkeeper: could not write keeper_interval_secs to %s; readers will fall back to the %ss default\n' "$cfg" "$interval" >&2
 
-  local ok=""
+  local ok="" install_status=0
   if [ -n "${VAULTKEEPER_INSTALL:-}" ]; then
-    "$VAULTKEEPER_INSTALL" "$tick" "$interval" && ok=1
+    if "$VAULTKEEPER_INSTALL" "$tick" "$interval"; then ok=1; else install_status=$?; fi
   else
-    bash "$scripts/install-watcher.sh" install "$tick" "$interval" && ok=1
+    if bash "$scripts/install-watcher.sh" install "$tick" "$interval"; then ok=1; else install_status=$?; fi
   fi
   if [ -n "$ok" ]; then
     printf 'vaultkeeper: activated watcher on this host (interval %ss)\n' "$interval" >&2
+  elif [ "$install_status" -eq 64 ]; then
+    # install-watcher reserves status 64 for an interval it cannot safely install.
+    # That is a persistent configuration refusal, not a scheduler outage that a
+    # retry with unchanged settings can fix.
+    printf 'vaultkeeper: watcher install refused on this host: interval "%s" is invalid or unsupported; correct keeper_interval_secs in %s before trying again\n' \
+      "$interval" "$cfg" >&2
   else
     printf 'vaultkeeper: watcher install FAILED on this host (will retry next session); run manually: bash %s/install-watcher.sh install %s %s\n' "$scripts" "$tick" "$interval" >&2
   fi

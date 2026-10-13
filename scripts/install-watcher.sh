@@ -4,6 +4,9 @@
 # (documented in README so a host scheduler audit surfaces it).
 set -euo pipefail
 LABEL="com.nhangen.obsidian-vaultkeeper"
+# Kept distinct from an ordinary install failure so callers can tell a permanent
+# interval/configuration refusal from a transient scheduler problem.
+INVALID_INTERVAL_STATUS=64
 
 usage() { echo "usage: install-watcher.sh {label|installed-program|state|render-launchd|render-cron|install} <tick_abs_path> [interval_secs]" >&2; exit 2; }
 
@@ -46,8 +49,37 @@ _own_cron_line() {
   esac
 }
 
+# Validate ASCII decimal input before any scheduler-specific work. Limiting it to 18 digits
+# keeps every accepted value below Bash's signed 64-bit arithmetic limit, including
+# on macOS's system Bash 3.2. Strip zero padding as text first: arithmetic on a
+# leading-zero value can interpret it as octal, while StartInterval must be a
+# positive decimal integer.
+normalize_interval() {
+  local original="$1" normalized
+  case "$original" in
+    ''|*[!0123456789]*)
+      printf "install-watcher: interval '%s' must be a nonzero decimal integer of at most 18 digits\n" "$original" >&2
+      return "$INVALID_INTERVAL_STATUS"
+      ;;
+  esac
+  if [ "${#original}" -gt 18 ]; then
+    printf "install-watcher: interval '%s' must be a nonzero decimal integer of at most 18 digits\n" "$original" >&2
+    return "$INVALID_INTERVAL_STATUS"
+  fi
+  normalized="$original"
+  while [ "${normalized#0}" != "$normalized" ]; do
+    normalized="${normalized#0}"
+  done
+  if [ -z "$normalized" ]; then
+    printf "install-watcher: interval '%s' must be greater than zero\n" "$original" >&2
+    return "$INVALID_INTERVAL_STATUS"
+  fi
+  printf '%s\n' "$normalized"
+}
+
 render_launchd() {
-  local tick="$1" interval="$2"
+  local tick="$1" interval
+  interval="$(normalize_interval "$2")" || return $?
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -73,24 +105,24 @@ EOF
 }
 
 render_cron() {
-  local tick="$1" interval="$2" minutes hours spec
-  case "$interval" in ''|*[!0-9]*) echo "install-watcher: interval '$interval' is not a number of seconds" >&2; return 1 ;; esac
-  # Strip leading zeros so $(( )) does not read 0900 as octal.
-  interval=$(( 10#$interval ))
+  local tick="$1" interval_input="$2" original_interval="${3-$2}" interval minutes hours spec
+  interval="$(normalize_interval "$interval_input")" || return $?
+  # The normalized, length-bounded value is decimal and cannot overflow Bash math.
+  interval=$(( interval ))
   if [ "$interval" -lt 60 ]; then
     spec='* * * * *'
   elif [ $(( interval % 60 )) -ne 0 ]; then
-    echo "install-watcher: ${interval}s is not a whole number of minutes; cron cannot express it" >&2; return 1
+    echo "install-watcher: interval '$original_interval' (${interval}s) is not a whole number of minutes; cron cannot express it" >&2; return "$INVALID_INTERVAL_STATUS"
   else
     minutes=$(( interval / 60 ))
     if [ "$minutes" -lt 60 ]; then
       # A step that does not divide the hour fires unevenly at the hour boundary.
-      [ $(( 60 % minutes )) -eq 0 ] || { echo "install-watcher: ${minutes}m does not divide an hour evenly; cron cannot express it" >&2; return 1; }
+      [ $(( 60 % minutes )) -eq 0 ] || { echo "install-watcher: interval '$original_interval' (${minutes}m) does not divide an hour evenly; cron cannot express it" >&2; return "$INVALID_INTERVAL_STATUS"; }
       spec="*/${minutes} * * * *"
     else
-      [ $(( minutes % 60 )) -eq 0 ] || { echo "install-watcher: ${interval}s is not a whole number of hours; cron cannot express it" >&2; return 1; }
+      [ $(( minutes % 60 )) -eq 0 ] || { echo "install-watcher: interval '$original_interval' (${interval}s) is not a whole number of hours; cron cannot express it" >&2; return "$INVALID_INTERVAL_STATUS"; }
       hours=$(( minutes / 60 ))
-      [ $(( 24 % hours )) -eq 0 ] || { echo "install-watcher: ${hours}h does not divide a day evenly; cron cannot express it" >&2; return 1; }
+      [ $(( 24 % hours )) -eq 0 ] || { echo "install-watcher: interval '$original_interval' (${hours}h) does not divide a day evenly; cron cannot express it" >&2; return "$INVALID_INTERVAL_STATUS"; }
       # */24 is past the hour field's maximum (23), same failure as */60 in minutes.
       if [ "$hours" -eq 1 ]; then spec='0 * * * *'
       elif [ "$hours" -eq 24 ]; then spec='0 0 * * *'
@@ -122,7 +154,10 @@ installed_program() {
 }
 
 install_watcher() {
-  local tick="$1" interval="${2:-900}"
+  local tick="$1" original_interval="$2" interval
+  # This gate intentionally precedes uname and every OS-specific side effect. In
+  # particular, launchd must never receive a malformed or zero StartInterval.
+  interval="$(normalize_interval "$original_interval")" || return $?
   case "$(uname -s)" in
     Darwin)
       local plist="$HOME/Library/LaunchAgents/${LABEL}.plist"
@@ -148,7 +183,8 @@ install_watcher() {
         echo "install-watcher: [$existing]" >&2
         exit 1
       fi
-      local line; line="$(render_cron "$tick" "$interval")" || exit 1
+      local line render_status
+      line="$(render_cron "$tick" "$interval" "$original_interval")" || { render_status=$?; exit "$render_status"; }
       # Read the crontab first. "no crontab for <user>" is an empty one; any other
       # failure aborts before anything is written, so a read error can never
       # install our line alone over the user's other entries.
@@ -186,6 +222,9 @@ case "${1:-}" in
   state)          printf '%s\t%s\n' "$LABEL" "$(installed_program || true)" ;;
   render-launchd) [ $# -ge 3 ] || usage; render_launchd "$2" "$3" ;;
   render-cron)    [ $# -ge 3 ] || usage; render_cron "$2" "$3" ;;
-  install)        [ $# -ge 2 ] || usage; install_watcher "$2" "${3:-900}" ;;
+  install)
+    [ $# -ge 2 ] || usage
+    if [ $# -ge 3 ]; then install_watcher "$2" "$3"; else install_watcher "$2" 900; fi
+    ;;
   *)              usage ;;
 esac

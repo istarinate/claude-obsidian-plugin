@@ -9,6 +9,43 @@ PLIST="$(bash "$SH" render-launchd "$TICK" 900)"
 grep -q 'com.nhangen.obsidian-vaultkeeper' <<<"$PLIST" || fail "plist missing namespace label"
 grep -qF "$TICK" <<<"$PLIST" || fail "plist missing tick path"
 grep -q '<integer>900</integer>' <<<"$PLIST" || fail "plist missing StartInterval"
+PLIST_PADDED="$(bash "$SH" render-launchd "$TICK" 000900)"
+grep -q '<integer>900</integer>' <<<"$PLIST_PADDED" || fail "launchd did not normalize leading zeroes"
+
+# Interval validation is shared by both renderers and has a distinct status from
+# an ordinary install failure. Preserve the exact submitted value in diagnostics,
+# including an overlong decimal rejected before Bash arithmetic can overflow.
+INVALID_INTERVAL_STATUS=64
+LONG_INTERVAL=18446744073709551616
+MAX_INTERVAL=999999999999999999
+MAX_PLIST="$(bash "$SH" render-launchd "$TICK" "$MAX_INTERVAL")"
+grep -q "<integer>${MAX_INTERVAL}</integer>" <<<"$MAX_PLIST" \
+  || fail "an 18-digit interval was incorrectly rejected or changed"
+MAX_CRON_ERR="$(mktemp "${TMPDIR:-/tmp}/iw-max-cron-XXXXXX")"
+if max_cron_out="$(bash "$SH" render-cron "$TICK" "$MAX_INTERVAL" 2>"$MAX_CRON_ERR")"; then
+  fail "cron accepted an unrepresentable 18-digit interval"
+else
+  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "18-digit cron refusal did not return status $INVALID_INTERVAL_STATUS"
+fi
+[ -z "$max_cron_out" ] || fail "18-digit cron refusal printed output: $max_cron_out"
+grep -Fq "(${MAX_INTERVAL}s)" "$MAX_CRON_ERR" \
+  || fail "18-digit cron diagnostic overflowed or lost its positive value: $(cat "$MAX_CRON_ERR")"
+rm -f "$MAX_CRON_ERR"
+for bad in "" 0 000 abc +900 -900 "$LONG_INTERVAL"; do
+  for mode in render-launchd render-cron; do
+    errfile="$(mktemp "${TMPDIR:-/tmp}/iw-interval-XXXXXX")"
+    if out="$(bash "$SH" "$mode" "$TICK" "$bad" 2>"$errfile")"; then
+      rm -f "$errfile"
+      fail "$mode accepted invalid interval '$bad'"
+    else
+      rc=$?
+    fi
+    [ "$rc" -eq "$INVALID_INTERVAL_STATUS" ] || { err="$(cat "$errfile")"; rm -f "$errfile"; fail "$mode returned $rc for '$bad', expected $INVALID_INTERVAL_STATUS: [$err]"; }
+    [ -z "$out" ] || { rm -f "$errfile"; fail "$mode printed output for invalid interval '$bad': $out"; }
+    grep -Fq -- "'$bad'" "$errfile" || { err="$(cat "$errfile")"; rm -f "$errfile"; fail "$mode diagnostic lost the original interval '$bad': $err"; }
+    rm -f "$errfile"
+  done
+done
 
 CRON="$(bash "$SH" render-cron "$TICK" 900)"
 grep -qF "$TICK" <<<"$CRON" || fail "cron line missing tick path"
@@ -29,6 +66,11 @@ for bad in 5400 420 90 18000 172800 abc; do
   if out="$(bash "$SH" render-cron "$TICK" "$bad" 2>/dev/null)"; then fail "interval $bad should be refused"; fi
   [ -z "$out" ] || fail "refused interval $bad must print no cron line, got: $out"
 done
+if bash "$SH" render-cron "$TICK" 5400 >/dev/null 2>&1; then
+  fail "cron's unrepresentable interval should return a configuration-refusal status"
+else
+  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "cron's unrepresentable interval did not return status $INVALID_INTERVAL_STATUS"
+fi
 
 # Drive the cron `install` branch with a stubbed uname and crontab (#144). The suite
 # otherwise only stubs launchctl, so a refused interval that wrote an empty line
@@ -53,8 +95,24 @@ chmod +x "$CRONDIR/bin/uname" "$CRONDIR/bin/crontab"
 LABEL_MARK='# com.nhangen.obsidian-vaultkeeper'
 printf '0 1 * * * /usr/bin/other\n*/15 * * * * /bin/bash "%s" >/dev/null 2>&1 %s\n' "$TICK" "$LABEL_MARK" > "$CRONDIR/crontab"
 BEFORE="$(cat "$CRONDIR/crontab")"
-if PATH="$CRONDIR/bin:$PATH" bash "$SH" install "$TICK" 5400 >/dev/null 2>&1; then fail "install of a refused interval should exit non-zero"; fi
+if PATH="$CRONDIR/bin:$PATH" bash "$SH" install "$TICK" 5400 >/dev/null 2>&1; then
+  fail "install of a refused interval should exit non-zero"
+else
+  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "install did not preserve the invalid-interval status"
+fi
 [ "$(cat "$CRONDIR/crontab")" = "$BEFORE" ] || fail "a refused install must leave the crontab untouched"
+if PATH="$CRONDIR/bin:$PATH" bash "$SH" install "$TICK" 0005400 >/dev/null 2>"$CRONDIR/unsupported.err"; then
+  fail "install accepted an interval cron cannot represent"
+else
+  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "cron constraint refusal did not preserve the invalid-interval status"
+fi
+grep -Fq "'0005400'" "$CRONDIR/unsupported.err" || fail "cron constraint diagnostic lost the original padded interval"
+if PATH="$CRONDIR/bin:$PATH" bash "$SH" install "$TICK" "" >/dev/null 2>"$CRONDIR/empty.err"; then
+  fail "install accepted an explicitly empty interval"
+else
+  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "empty interval did not return the invalid-interval status"
+fi
+[ "$(cat "$CRONDIR/crontab")" = "$BEFORE" ] || fail "invalid interval installs changed the crontab"
 PATH="$CRONDIR/bin:$PATH" bash "$SH" install "$TICK" 3600 >/dev/null 2>&1 || fail "install of 3600 should succeed over an existing */15 line"
 [ "$(grep -cF "$LABEL_MARK" "$CRONDIR/crontab")" = 1 ] || fail "re-install must leave exactly one watcher line"
 grep -q '^0 \* \* \* \* ' "$CRONDIR/crontab" || fail "re-install should write the hourly line"
@@ -126,6 +184,16 @@ PL="$HOMEDIR/Library/LaunchAgents/com.nhangen.obsidian-vaultkeeper.plist"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$HOMEDIR/bin/launchctl"
 printf '#!/usr/bin/env bash\necho Darwin\n' > "$HOMEDIR/bin/uname"
 chmod +x "$HOMEDIR/bin/launchctl" "$HOMEDIR/bin/uname"
+
+# Invalid intervals must be refused before OS dispatch or plist creation. This is
+# the regression for launchd accepting a malformed StartInterval that cron rejected.
+if HOME="$HOMEDIR" PATH="$HOMEDIR/bin:$PATH" bash "$SH" install "$TICK" 000 >"$HOMEDIR/invalid.out" 2>"$HOMEDIR/invalid.err"; then
+  fail "macOS install accepted a zero interval"
+else
+  [ "$?" -eq "$INVALID_INTERVAL_STATUS" ] || fail "macOS invalid interval did not return status $INVALID_INTERVAL_STATUS"
+fi
+[ ! -e "$PL" ] || fail "macOS install created a plist for an invalid interval"
+grep -Fq "'000'" "$HOMEDIR/invalid.err" || fail "macOS refusal did not retain the original interval"
 
 write_delegator_plist() {
   cat > "$PL" <<EOF

@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+INVALID_INTERVAL_STATUS=64
 . "${ROOT_DIR}/scripts/lib/keeper-bootstrap.sh"
 INSTALLER="${ROOT_DIR}/scripts/install-watcher.sh"
 
@@ -120,6 +121,26 @@ ERR="$(KEEPER_OS="Darwin" keeper_ensure_active "$CFGF" "$VAULTF" 900 2>&1 >/dev/
   || fail "ensure_active must return 0 even when install fails (never abort the hook)"
 [ -s "$FAILCALLS" ] || fail "failing install was never attempted"
 grep -qi 'FAILED' <<<"$ERR" || fail "failed install was silent — no diagnostic emitted: '$ERR'"
+grep -q 'will retry next session' <<<"$ERR" || fail "transient install failure did not retain its retry guidance: '$ERR'"
+
+# Status 64 is the installer's permanent interval/configuration refusal. It must
+# get an actionable message rather than promising that an unchanged value will
+# work on the next session.
+REFUSE="$WORK/refuse.sh"
+printf '#!/usr/bin/env bash\nexit %s\n' "$INVALID_INTERVAL_STATUS" > "$REFUSE"
+chmod +x "$REFUSE"
+export VAULTKEEPER_INSTALL="$REFUSE"
+CFGR="$WORK/refused-interval.local.md"; VAULTR="$WORK/vault-refused"
+printf -- '---\nvault_path: %s\nkeeper_interval_secs: 009x\n---\n' "$VAULTR" > "$CFGR"
+mk_vault "$VAULTR"
+RERR="$(KEEPER_OS="Darwin" keeper_ensure_active "$CFGR" "$VAULTR" 009x 2>&1 >/dev/null)" \
+  || fail "ensure_active must return 0 after a permanent interval refusal"
+grep -q '009x' <<<"$RERR" || fail "permanent refusal did not preserve the submitted interval: [$RERR]"
+grep -q 'keeper_interval_secs' <<<"$RERR" || fail "permanent refusal did not identify the configuration key: [$RERR]"
+grep -q 'correct' <<<"$RERR" || fail "permanent refusal did not explain how to resolve it: [$RERR]"
+if grep -q 'will retry next session' <<<"$RERR"; then
+  fail "permanent configuration refusal incorrectly promised a retry: [$RERR]"
+fi
 
 # --- a failed config write leaves a trace (#40) ---
 # A read-only parent dir makes _kb_cfg_ensure's sibling staging fail the way a full or
